@@ -8,19 +8,22 @@ import base64
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
+import re
 import secrets
 import sqlite3
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "super_math_teacher.db"
+COURSEWARE_DIR = DATA_DIR / "courseware"
 SECRET = os.environ.get("SMT_SECRET", "dev-secret-change-me")
 TOKEN_TTL = 60 * 60 * 24 * 7
 PBKDF2_ROUNDS = 180_000
@@ -45,6 +48,23 @@ def optional_int(value: Any) -> Optional[int]:
     if value in (None, ""):
         return None
     return int(value)
+
+
+def migrate_course_sections(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(course_sections)").fetchall()}
+    migrations = [
+        ("class_id", "ALTER TABLE course_sections ADD COLUMN class_id INTEGER REFERENCES classes(id) ON DELETE SET NULL"),
+        ("file_path", "ALTER TABLE course_sections ADD COLUMN file_path TEXT"),
+        ("file_url", "ALTER TABLE course_sections ADD COLUMN file_url TEXT"),
+    ]
+    for column, sql in migrations:
+        if column not in columns:
+            conn.execute(sql)
+
+
+def safe_courseware_filename(section_id: int, title: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "-", title).strip("-")[:42]
+    return f"section-{section_id}-{slug or 'courseware'}.html"
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -92,6 +112,7 @@ def token_user_id(token: str) -> Optional[int]:
 
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    COURSEWARE_DIR.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
         conn.executescript(
             """
@@ -152,9 +173,12 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS course_sections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+                class_id INTEGER REFERENCES classes(id) ON DELETE SET NULL,
                 title TEXT NOT NULL,
                 summary TEXT,
                 html_content TEXT NOT NULL,
+                file_path TEXT,
+                file_url TEXT,
                 sort_order INTEGER NOT NULL DEFAULT 1,
                 created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
                 created_at INTEGER NOT NULL,
@@ -169,6 +193,7 @@ def init_db() -> None:
             );
             """
         )
+        migrate_course_sections(conn)
 
         exists = conn.execute("SELECT id FROM users WHERE username = ?", ("admin",)).fetchone()
         if not exists:
@@ -269,6 +294,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
+        if self.path.startswith("/static/courseware/"):
+            self.serve_courseware_file()
+            return
         self.dispatch("GET")
 
     def do_POST(self) -> None:
@@ -313,6 +341,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def serve_courseware_file(self) -> None:
+        parsed = urlparse(self.path)
+        filename = Path(unquote(parsed.path).replace("/static/courseware/", "", 1)).name
+        file_path = COURSEWARE_DIR / filename
+        if not file_path.exists() or not file_path.is_file():
+            self.write_json(404, {"error": "教材不存在"})
+            return
+        content = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(file_path.name)[0] or "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
 
     def current_user(self) -> sqlite3.Row:
         header = self.headers.get("Authorization", "")
@@ -375,6 +417,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.create_course_section(body)
         if path.startswith("/api/course-sections/") and method == "GET":
             return self.get_course_section(int(path.rsplit("/", 1)[1]))
+        if path.startswith("/api/course-sections/") and method == "DELETE":
+            return self.delete_course_section(int(path.rsplit("/", 1)[1]))
+        if path == "/api/public/courseware" and method == "GET":
+            return self.public_courseware(query)
         if path == "/api/notices" and method == "GET":
             return self.list_notices()
         raise ApiError(404, "接口不存在")
@@ -625,10 +671,12 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT cs.id, cs.course_id, cs.title, cs.summary, cs.sort_order, cs.created_by,
-                       cs.created_at, cs.updated_at, co.name AS course_name, u.name AS creator_name
+                SELECT cs.id, cs.course_id, cs.class_id, cs.title, cs.summary, cs.file_url,
+                       cs.sort_order, cs.created_by, cs.created_at, cs.updated_at,
+                       co.name AS course_name, c.name AS class_name, u.name AS creator_name
                 FROM course_sections cs
                 LEFT JOIN courses co ON co.id = cs.course_id
+                LEFT JOIN classes c ON c.id = cs.class_id
                 LEFT JOIN users u ON u.id = cs.created_by
                 {where}
                 ORDER BY cs.course_id, cs.sort_order, cs.created_at
@@ -642,9 +690,10 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as conn:
             row = conn.execute(
                 """
-                SELECT cs.*, co.name AS course_name, u.name AS creator_name
+                SELECT cs.*, co.name AS course_name, c.name AS class_name, u.name AS creator_name
                 FROM course_sections cs
                 LEFT JOIN courses co ON co.id = cs.course_id
+                LEFT JOIN classes c ON c.id = cs.class_id
                 LEFT JOIN users u ON u.id = cs.created_by
                 WHERE cs.id = ?
                 """,
@@ -654,29 +703,63 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(404, "小节不存在")
         return 200, {"item": row_to_dict(row)}
 
+    def delete_course_section(self, section_id: int) -> Tuple[int, Dict[str, Any]]:
+        user = self.current_user()
+        with connect() as conn:
+            row = conn.execute(
+                """
+                SELECT cs.*, co.teacher_id
+                FROM course_sections cs
+                LEFT JOIN courses co ON co.id = cs.course_id
+                WHERE cs.id = ?
+                """,
+                (section_id,),
+            ).fetchone()
+            if not row:
+                raise ApiError(404, "教材不存在")
+            if user["role"] == "TEACHER" and row["teacher_id"] not in (None, user["id"]):
+                raise ApiError(403, "只能删除自己任教课程的教材")
+
+            file_path = row["file_path"]
+            conn.execute("DELETE FROM course_sections WHERE id = ?", (section_id,))
+
+        if file_path:
+            try:
+                path = Path(file_path)
+                if path.exists() and path.is_file() and COURSEWARE_DIR in path.resolve().parents:
+                    path.unlink()
+            except Exception as exc:
+                print(f"删除教材文件失败: {exc}")
+        return 200, {"ok": True}
+
     def create_course_section(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         user = self.current_user()
         course_id = optional_int(body.get("courseId"))
+        class_id = optional_int(body.get("classId"))
         title = str(body.get("title", "")).strip()
         html = str(body.get("htmlContent", "")).strip()
-        if not course_id or not title or not html:
-            raise ApiError(400, "课程、小节名称和 HTML 内容必填")
+        if not course_id or not class_id or not title or not html:
+            raise ApiError(400, "课程、班级、教材名称和 HTML 内容必填")
         if len(html.encode("utf-8")) > 5 * 1024 * 1024:
             raise ApiError(400, "HTML 内容不能超过 5MB")
         with connect() as conn:
             course = conn.execute("SELECT * FROM courses WHERE id = ?", (course_id,)).fetchone()
             if not course:
                 raise ApiError(404, "课程不存在")
+            klass = conn.execute("SELECT * FROM classes WHERE id = ?", (class_id,)).fetchone()
+            if not klass:
+                raise ApiError(404, "班级不存在")
             if user["role"] == "TEACHER" and course["teacher_id"] not in (None, user["id"]):
                 raise ApiError(403, "只能维护自己任教课程的小节")
             ts = now_ts()
             cur = conn.execute(
                 """
-                INSERT INTO course_sections(course_id, title, summary, html_content, sort_order, created_by, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO course_sections(course_id, class_id, title, summary, html_content, sort_order, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     course_id,
+                    class_id,
                     title,
                     body.get("summary"),
                     html,
@@ -686,7 +769,45 @@ class Handler(BaseHTTPRequestHandler):
                     ts,
                 ),
             )
-        return 201, {"ok": True, "id": cur.lastrowid}
+            section_id = cur.lastrowid
+            filename = safe_courseware_filename(section_id, title)
+            file_path = COURSEWARE_DIR / filename
+            file_path.write_text(html, encoding="utf-8")
+            file_url = f"/static/courseware/{filename}"
+            conn.execute(
+                "UPDATE course_sections SET file_path = ?, file_url = ? WHERE id = ?",
+                (str(file_path), file_url, section_id),
+            )
+        return 201, {"ok": True, "id": section_id, "fileUrl": file_url}
+
+    def public_courseware(self, query: Dict[str, str]) -> Tuple[int, Dict[str, Any]]:
+        class_id = query.get("classId")
+        class_name = str(query.get("className") or "").strip()
+        params = []
+        where = "WHERE cs.file_url IS NOT NULL"
+        if class_id:
+            where += " AND cs.class_id = ?"
+            params.append(int(class_id))
+        elif class_name:
+            where += " AND c.name = ?"
+            params.append(class_name)
+        else:
+            raise ApiError(400, "请提供 classId 或 className")
+
+        with connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT cs.id, cs.title, cs.summary, cs.file_url, cs.sort_order,
+                       cs.created_at, co.name AS course_name, c.name AS class_name, c.grade
+                FROM course_sections cs
+                LEFT JOIN courses co ON co.id = cs.course_id
+                LEFT JOIN classes c ON c.id = cs.class_id
+                {where}
+                ORDER BY cs.sort_order, cs.created_at DESC
+                """,
+                params,
+            ).fetchall()
+        return 200, {"items": [row_to_dict(r) for r in rows]}
 
     def list_notices(self) -> Tuple[int, Dict[str, Any]]:
         self.current_user()
